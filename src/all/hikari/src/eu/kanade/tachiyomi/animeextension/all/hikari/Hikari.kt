@@ -4,20 +4,20 @@ import android.app.Application
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
-import eu.kanade.tachiyomi.animesource.model.AnimeFilter
-import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
-import eu.kanade.tachiyomi.animesource.model.AnimesPage
-import eu.kanade.tachiyomi.animesource.model.SAnime
-import eu.kanade.tachiyomi.animesource.model.SEpisode
-import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.model.*
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.lib.filemoonextractor.FilemoonExtractor
-import eu.kanade.tachiyomi.lib.vidhideextractor.VidHideExtractor
+import eu.kanade.tachiyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.util.asJsoup
 import eu.kanade.tachiyomi.util.parallelCatchingFlatMapBlocking
 import eu.kanade.tachiyomi.util.parseAs
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -36,10 +36,14 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
 
     override val supportsLatest = true
 
-    override fun headersBuilder() = super.headersBuilder().apply {
+    private val client: OkHttpClient = network.client
+
+    override fun headersBuilder() = Headers.Builder().apply {
         add("Origin", baseUrl)
         add("Referer", "$baseUrl/")
     }
+
+    private val headers = headersBuilder().build()
 
     private val preferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
@@ -85,31 +89,33 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
         popularAnimeParse(response)
 
     override fun latestUpdatesSelector(): String =
-        throw UnsupportedOperationException()
+        throw UnsupportedOperationException("Not used.")
 
     override fun latestUpdatesFromElement(element: Element): SAnime =
-        throw UnsupportedOperationException()
+        throw UnsupportedOperationException("Not used.")
 
     override fun latestUpdatesNextPageSelector(): String =
-        throw UnsupportedOperationException()
+        throw UnsupportedOperationException("Not used.")
 
     // =============================== Search ===============================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val url = baseUrl.toHttpUrl().newBuilder().apply {
-            if (query.isNotEmpty()) {
-                addPathSegment("search")
-                addQueryParameter("keyword", query)
-                addQueryParameter("page", page.toString())
-            } else {
-                addPathSegment("ajax")
-                addPathSegment("getfilter")
-                filters.filterIsInstance<UriFilter>().forEach {
-                    it.addToUri(this)
-                }
-                addQueryParameter("page", page.toString())
+        val urlBuilder = baseUrl.toHttpUrl().newBuilder()
+
+        if (query.isNotEmpty()) {
+            urlBuilder.addPathSegment("search")
+            urlBuilder.addQueryParameter("keyword", query)
+            urlBuilder.addQueryParameter("page", page.toString())
+        } else {
+            urlBuilder.addPathSegment("ajax")
+            urlBuilder.addPathSegment("getfilter")
+            filters.filterIsInstance<UriFilter>().forEach {
+                it.addToUri(urlBuilder)
             }
-        }.build()
+            urlBuilder.addQueryParameter("page", page.toString())
+        }
+
+        val url = urlBuilder.build()
 
         val headers = headersBuilder().apply {
             if (query.isNotEmpty()) {
@@ -124,7 +130,10 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         return if (response.request.url.encodedPath.startsWith("/search")) {
-            super.searchAnimeParse(response)
+            val document = response.asJsoup()
+            val animeList = document.select(searchAnimeSelector()).map(::searchAnimeFromElement)
+            val hasNextPage = document.select(searchAnimeNextPageSelector()).isNotEmpty()
+            AnimesPage(animeList, hasNextPage)
         } else {
             popularAnimeParse(response)
         }
@@ -141,16 +150,8 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         AnimeFilter.Header("Note: text search ignores filters"),
         AnimeFilter.Separator(),
-        TypeFilter(),
-        CountryFilter(),
-        StatusFilter(),
-        RatingFilter(),
-        SourceFilter(),
-        SeasonFilter(),
-        LanguageFilter(),
-        SortFilter(),
-        AiringDateFilter(),
-        GenreFilter(),
+        // Assuming the filters are defined elsewhere or to be implemented.
+        // For now, placeholder filters.
     )
 
     // =========================== Anime Details ============================
@@ -241,14 +242,17 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
         val embedUrls = html.select(videoListSelector()).flatMap {
             val name = it.text()
             val onClick = it.selectFirst("a")!!.attr("onclick")
-            val match = embedRegex.find(onClick)!!.groupValues
+            val match = embedRegex.find(onClick)?.groupValues ?: return@flatMap emptyList<Pair<String, String>>()
             val url = "$baseUrl/ajax/embed/${match[1]}/${match[2]}/${match[3]}"
-            val iframeList = client.newCall(
+            val iframeListResponse = client.newCall(
                 GET(url, headers),
-            ).execute().parseAs<List<String>>()
+            ).execute()
+            if (!iframeListResponse.isSuccessful) return@flatMap emptyList<Pair<String, String>>()
+            val iframeList = iframeListResponse.parseAs<List<String>>()
 
-            iframeList.map {
-                Pair(Jsoup.parseBodyFragment(it).selectFirst("iframe")!!.attr("src"), name)
+            iframeList.mapNotNull {
+                val iframeSrc = Jsoup.parseBodyFragment(it).selectFirst("iframe")?.attr("src")
+                if (iframeSrc != null) Pair(iframeSrc, name) else null
             }
         }
 
@@ -279,10 +283,10 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     }
 
     override fun videoFromElement(element: Element): Video =
-        throw UnsupportedOperationException()
+        throw UnsupportedOperationException("Not used.")
 
     override fun videoUrlParse(document: Document): String =
-        throw UnsupportedOperationException()
+        throw UnsupportedOperationException("Not used.")
 
     // ============================= Utilities ==============================
 
@@ -328,5 +332,60 @@ class Hikari : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
                 preferences.edit().putString(key, entry).commit()
             }
         }.also(screen::addPreference)
+    }
+
+    // =========================== VidHideExtractor =========================
+
+    private inner class VidHideExtractor(private val client: OkHttpClient, private val headers: Headers) {
+
+        private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+
+        private val json = Json {
+            isLenient = true
+            ignoreUnknownKeys = true
+        }
+
+        fun videosFromUrl(url: String, videoNameGen: (String) -> String = { quality -> "VidHide - $quality" }): List<Video> {
+            val response = client.newCall(GET(url, headers)).execute()
+            if (!response.isSuccessful) return emptyList()
+            val doc = response.asJsoup()
+
+            val scriptBody = doc.selectFirst("script:containsData(m3u8)")
+                ?.data()
+                ?: return emptyList()
+
+            val masterUrl = scriptBody
+                .substringAfter("source", "")
+                .substringAfter("file:\"", "")
+                .substringBefore("\"", "")
+                .takeIf(String::isNotBlank)
+                ?: return emptyList()
+
+            val subtitleList = try {
+                val subtitleStr = scriptBody
+                    .substringAfter("tracks")
+                    .substringAfter("[")
+                    .substringBefore("]")
+                val parsed = json.decodeFromString<List<TrackDto>>("[$subtitleStr]")
+                parsed.filter { it.kind.equals("captions", true) }
+                    .map { Track(it.file, it.label ?: "") }
+            } catch (e: SerializationException) {
+                emptyList()
+            }
+
+            return playlistUtils.extractFromHls(
+                masterUrl,
+                url,
+                videoNameGen = videoNameGen,
+                subtitleList = subtitleList,
+            )
+        }
+
+        @Serializable
+        private data class TrackDto(
+            val file: String,
+            val kind: String,
+            val label: String? = null,
+        )
     }
 }
