@@ -21,38 +21,47 @@ class VidHideExtractor(private val client: OkHttpClient, private val headers: He
     }
 
     fun videosFromUrl(url: String, videoNameGen: (String) -> String = { quality -> "VidHide - $quality" }): List<Video> {
-        val doc = client.newCall(GET(url, headers)).execute()
-            .asJsoup()
+        try {
+            val doc = client.newCall(GET(url, headers)).execute()
+                .asJsoup()
 
-        val scriptBody = doc.selectFirst("script:containsData(m3u8)")
-            ?.data()
-            ?: return emptyList()
+            val scriptBody = doc.selectFirst("script:containsData(m3u8)")
+                ?.data()
+                ?: return emptyList()
 
-        val masterUrl = scriptBody
-            .substringAfter("source", "")
-            .substringAfter("file:\"", "")
-            .substringBefore("\"", "")
-            .takeIf(String::isNotBlank)
-            ?: return emptyList()
+            val masterUrl = extractMasterUrl(scriptBody)
+            val subtitleList = extractSubtitleList(scriptBody)
 
-        val subtitleList = try {
+            return playlistUtils.extractFromHls(
+                masterUrl,
+                url,
+                videoNameGen = videoNameGen,
+                subtitleList = subtitleList,
+            )
+        } catch (e: Exception) {
+            // Handle exception
+            return emptyList()
+        }
+    }
+
+    private fun extractMasterUrl(scriptBody: String): String? {
+        val pattern = Regex("source\\s*=\\s*\"(.*?)\"")
+        return pattern.find(scriptBody)?.groupValues?.get(1)
+    }
+
+    private fun extractSubtitleList(scriptBody: String): List<Track> {
+        try {
             val subtitleStr = scriptBody
                 .substringAfter("tracks")
                 .substringAfter("[")
                 .substringBefore("]")
             val parsed = json.decodeFromString<List<TrackDto>>("[$subtitleStr]")
-            parsed.filter { it.kind.equals("captions", true) }
-                .map { Track(it.file, it.label!!) }
+            return parsed.filter { it.kind.equals("captions", true) }
+                .map { Track(it.file, it.label ?: "") }
         } catch (e: SerializationException) {
-            emptyList()
+            // Handle exception
+            return emptyList()
         }
-
-        return playlistUtils.extractFromHls(
-            masterUrl,
-            url,
-            videoNameGen = videoNameGen,
-            subtitleList = subtitleList,
-        )
     }
 
     @Serializable
